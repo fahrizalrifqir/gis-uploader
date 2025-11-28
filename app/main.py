@@ -6,29 +6,50 @@ import shutil
 import tempfile
 import subprocess
 import asyncio
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header, Query
 from fastapi.responses import JSONResponse, FileResponse
+from starlette.background import BackgroundTask
 import asyncpg
+import logging
 
-# Konfigurasi dari env
-DB_DSN = os.getenv("DATABASE_DSN")  # contoh: postgresql://user:pass@host:5432/dbname
+# -------------------------
+# Konfigurasi dari ENV
+# -------------------------
+DB_DSN = os.getenv("DATABASE_DSN")
+if not DB_DSN:
+    raise RuntimeError("Environment variable DATABASE_DSN belum diset. Isi connection string Supabase Anda.")
+
 TARGET_TABLE = os.getenv("TARGET_TABLE", "public.tapak_proyek")
 STAGING_TABLE = os.getenv("STAGING_TABLE", "public.staging_tapak_upload")
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50*1024*1024)))  # default 50 MB
-API_KEY = os.getenv("API_KEY")  # optional - jika diset, semua request butuh header x-api-key
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))  # default 50MB
+API_KEY = os.getenv("API_KEY")  # jika di-set, header x-api-key wajib
 
+# -------------------------
+# Setup aplikasi
+# -------------------------
 app = FastAPI(title="GIS Uploader - Tapak Proyek")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("gis_uploader")
 
-# Simple API key dependency
+# -------------------------
+# Dependency: API key sederhana
+# -------------------------
 def require_api_key(x_api_key: Optional[str] = Header(None)):
     if API_KEY:
         if not x_api_key or x_api_key != API_KEY:
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-# Helper: run ogr2ogr import into staging
+# -------------------------
+# Helper: menjalankan ogr2ogr untuk import ke staging
+# -------------------------
 def ogr2ogr_import(shp_dir: str, staging_table: str):
+    """
+    Menemukan file .shp di shp_dir lalu menjalankan ogr2ogr untuk memasukkannya
+    ke PostGIS sebagai staging_table (overwrite).
+    Memaksa reprojeksi ke EPSG:4326 dan geometry name 'geom'.
+    """
     shp_file = None
     for f in os.listdir(shp_dir):
         if f.lower().endswith(".shp"):
@@ -37,7 +58,6 @@ def ogr2ogr_import(shp_dir: str, staging_table: str):
     if not shp_file:
         raise RuntimeError("Tidak ditemukan file .shp di dalam zip.")
 
-    # Build ogr2ogr command. Force geometry name 'geom' and overwrite staging table.
     cmd = [
         "ogr2ogr",
         "-f", "PostgreSQL",
@@ -49,55 +69,90 @@ def ogr2ogr_import(shp_dir: str, staging_table: str):
         "-lco", "ENCODING=UTF-8",
         "-t_srs", "EPSG:4326"
     ]
+    logger.info("Menjalankan ogr2ogr import: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
+        logger.error("ogr2ogr error: %s", proc.stderr)
         raise RuntimeError(f"ogr2ogr gagal: {proc.stderr}")
 
-# Helper: get columns list for table
-async def get_table_columns(conn, table_fullname: str):
+# -------------------------
+# Helper DB: kolom tabel
+# -------------------------
+async def get_table_columns(conn: asyncpg.Connection, table_fullname: str) -> List[str]:
+    """
+    Kembalikan list nama kolom untuk table_fullname dalam format 'schema.table'
+    """
+    if "." not in table_fullname:
+        raise ValueError("Table name harus berformat schema.table")
     schema, table = table_fullname.split(".", 1)
-    rows = await conn.fetch("""
+    rows = await conn.fetch(
+        """
         SELECT column_name
         FROM information_schema.columns
         WHERE table_schema = $1 AND table_name = $2
         ORDER BY ordinal_position;
-    """, schema, table)
+        """,
+        schema, table
+    )
     return [r["column_name"] for r in rows]
 
-# Helper: append from staging to target with mapping by column name (case insensitive)
-async def append_from_staging(conn, target_table: str, staging_table: str) -> int:
+# -------------------------
+# Helper: append dari staging ke target
+# -------------------------
+async def append_from_staging(conn: asyncpg.Connection, target_table: str, staging_table: str) -> int:
+    """
+    Mapping kolom berdasarkan nama (case-insensitive).
+    Untuk kolom target yang tidak ada di staging akan diisi NULL.
+    Mengembalikan jumlah baris yang di-insert.
+    """
     target_cols = await get_table_columns(conn, target_table)
     staging_cols = await get_table_columns(conn, staging_table)
 
-    # Normalize names to lower for matching
-    staging_set = {c.lower(): c for c in staging_cols}
+    # create mapping staging lowercase -> original name
+    staging_map = {c.lower(): c for c in staging_cols}
 
     insert_cols = []
     select_exprs = []
     for col in target_cols:
-        if col == "id":
+        if col == "id":  # skip primary serial
             continue
         insert_cols.append(col)
-        # match by lower-case name
-        if col.lower() in staging_set:
-            select_exprs.append(f"{staging_set[col.lower()]} AS {col}")
+        if col.lower() in staging_map:
+            # gunakan nama kolom staging asli, lalu alias ke nama target
+            select_exprs.append(f"{staging_map[col.lower()]} AS {col}")
         else:
             select_exprs.append(f"NULL AS {col}")
+
+    if not insert_cols:
+        raise RuntimeError("Tidak ada kolom untuk di-insert ke tabel target.")
 
     insert_cols_sql = ", ".join(insert_cols)
     select_sql = ", ".join(select_exprs)
     sql = f"INSERT INTO {target_table} ({insert_cols_sql}) SELECT {select_sql} FROM {staging_table};"
+    logger.info("Menjalankan append SQL ke target")
     res = await conn.execute(sql)
-    # asyncpg returns 'INSERT 0 X'
+    # asyncpg execute mengembalikan 'INSERT 0 X' -> ambil angka terakhir
     try:
         inserted = int(res.split()[-1])
-    except:
+    except Exception:
         inserted = 0
     return inserted
 
-# Endpoint upload shapefile zip
+# -------------------------
+# Endpoint: upload shapefile zip
+# -------------------------
 @app.post("/upload", dependencies=[Depends(require_api_key)])
 async def upload_shp(file: UploadFile = File(...)):
+    """
+    Menerima file ZIP yang berisi shapefile (.shp .dbf .shx .prj).
+    Proses:
+    - simpan sementara
+    - extract
+    - ogr2ogr import ke staging table
+    - append ke target table
+    - trunc staging
+    - kembalikan jumlah fitur yang ditambahkan
+    """
     if not file.filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Unggah file .zip yang berisi shapefile (.shp .dbf .shx .prj).")
 
@@ -115,20 +170,19 @@ async def upload_shp(file: UploadFile = File(...)):
             z.extractall(tmp_dir)
     except Exception as e:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail=f"Gagal ekstrak ZIP: {e}")
+        raise HTTPException(status_code=400, detail=f"Gagal mengekstrak ZIP: {e}")
 
-    # Run ogr2ogr to import to staging table
+    # import to staging (blocking) via thread
     try:
         await asyncio.to_thread(ogr2ogr_import, tmp_dir, STAGING_TABLE)
     except Exception as e:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Import shapefile gagal: {e}")
 
-    # Connect to DB and append
     conn = await asyncpg.connect(DB_DSN)
     try:
         inserted = await append_from_staging(conn, TARGET_TABLE, STAGING_TABLE)
-        # cleanup staging table rows (but keep table)
+        # kosongkan staging table (tetap biarkan strukturnya jika perlu)
         await conn.execute(f"TRUNCATE TABLE {STAGING_TABLE};")
     finally:
         await conn.close()
@@ -136,8 +190,13 @@ async def upload_shp(file: UploadFile = File(...)):
 
     return JSONResponse({"status": "ok", "inserted_rows": inserted})
 
-# Helper export via ogr2ogr (blocking)
+# -------------------------
+# Helper export: ogr2ogr export dan zip
+# -------------------------
 def _run_ogr2ogr_export(sql: str, out_dir: str, layer_name: str = "export_tapak"):
+    """
+    Jalankan ogr2ogr untuk mengekspor hasil SQL dari PostGIS ke shapefile di out_dir.
+    """
     out_path = os.path.join(out_dir, layer_name + ".shp")
     cmd = [
         "ogr2ogr",
@@ -149,14 +208,16 @@ def _run_ogr2ogr_export(sql: str, out_dir: str, layer_name: str = "export_tapak"
         "-lco", "ENCODING=UTF-8",
         "-t_srs", "EPSG:4326"
     ]
+    logger.info("Menjalankan ogr2ogr export: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
+        logger.error("ogr2ogr export failed: %s", proc.stderr)
         raise RuntimeError(f"ogr2ogr export gagal: {proc.stderr}")
 
-def _zip_shapefile_dir(src_dir: str, zip_out_path: str):
+def _zip_shapefile_dir(src_dir: str, zip_out_path: str) -> str:
     base = zip_out_path.replace(".zip", "")
-    shutil.make_archive(base_name=base, format='zip', root_dir=src_dir)
-    return base + ".zip"
+    archive = shutil.make_archive(base_name=base, format='zip', root_dir=src_dir)
+    return archive
 
 async def _export_sql_to_zip(sql: str, zip_name: str):
     tmpdir = tempfile.mkdtemp(prefix="export_")
@@ -168,13 +229,15 @@ async def _export_sql_to_zip(sql: str, zip_name: str):
                 os.remove(zip_path)
             except:
                 pass
-        zip_created = await asyncio.to_thread(_zip_shapefile_dir, tmpdir, zip_path)
-        return tmpdir, zip_created
+        created = await asyncio.to_thread(_zip_shapefile_dir, tmpdir, zip_path)
+        return tmpdir, created
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
 
-# Download all features
+# -------------------------
+# Endpoint: download all
+# -------------------------
 @app.get("/download/all", dependencies=[Depends(require_api_key)])
 async def download_all():
     sql = f"SELECT * FROM {TARGET_TABLE}"
@@ -182,17 +245,19 @@ async def download_all():
     if not os.path.exists(zip_path):
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise HTTPException(status_code=500, detail="Gagal membuat file export.")
-    response = FileResponse(path=zip_path, filename="tapak_proyek_all.zip", media_type="application/zip")
-    @response.background
+    # gunakan BackgroundTask untuk cleanup setelah response selesai
     def _cleanup():
         try:
             os.remove(zip_path)
         except:
             pass
         shutil.rmtree(tmpdir, ignore_errors=True)
-    return response
+    return FileResponse(path=zip_path, filename="tapak_proyek_all.zip", media_type="application/zip",
+                        background=BackgroundTask(_cleanup))
 
-# Download by id
+# -------------------------
+# Endpoint: download by id
+# -------------------------
 @app.get("/download/id/{feature_id}", dependencies=[Depends(require_api_key)])
 async def download_by_id(feature_id: int):
     sql = f"SELECT * FROM {TARGET_TABLE} WHERE id = {feature_id}"
@@ -200,23 +265,24 @@ async def download_by_id(feature_id: int):
     if not os.path.exists(zip_path):
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise HTTPException(status_code=404, detail="Fitur tidak ditemukan atau export gagal.")
-    response = FileResponse(path=zip_path, filename=f"tapak_proyek_id_{feature_id}.zip", media_type="application/zip")
-    @response.background
     def _cleanup():
         try:
             os.remove(zip_path)
         except:
             pass
         shutil.rmtree(tmpdir, ignore_errors=True)
-    return response
+    return FileResponse(path=zip_path, filename=f"tapak_proyek_id_{feature_id}.zip", media_type="application/zip",
+                        background=BackgroundTask(_cleanup))
 
-# Download by comma-separated ids, e.g. ?ids=1,2,5
+# -------------------------
+# Endpoint: download by ids (comma separated)
+# -------------------------
 @app.get("/download/ids", dependencies=[Depends(require_api_key)])
-async def download_by_ids(ids: str = Query(...)):
+async def download_by_ids(ids: str = Query(..., description="Contoh: ids=1,3,5")):
     try:
         id_list = [int(x) for x in ids.split(",") if x.strip() != ""]
     except ValueError:
-        raise HTTPException(status_code=400, detail="Format ids salah.")
+        raise HTTPException(status_code=400, detail="Format ids salah. Gunakan angka dipisah koma.")
     if not id_list:
         raise HTTPException(status_code=400, detail="Daftar id kosong.")
     id_str = ",".join(str(i) for i in id_list)
@@ -225,12 +291,11 @@ async def download_by_ids(ids: str = Query(...)):
     if not os.path.exists(zip_path):
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise HTTPException(status_code=404, detail="Export gagal.")
-    response = FileResponse(path=zip_path, filename=f"tapak_proyek_ids_{id_str}.zip", media_type="application/zip")
-    @response.background
     def _cleanup():
         try:
             os.remove(zip_path)
         except:
             pass
         shutil.rmtree(tmpdir, ignore_errors=True)
-    return response
+    return FileResponse(path=zip_path, filename=f"tapak_proyek_ids_{id_str}.zip", media_type="application/zip",
+                        background=BackgroundTask(_cleanup))
