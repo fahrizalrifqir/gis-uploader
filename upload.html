@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Upload SHP</title></head>
+<body>
+  <h3>Upload shapefile (zip)</h3>
+  <form id="frm">
+    <input type="file" id="file" name="file" accept=".zip" />
+    <input type="text" id="apikey" placeholder="API Key (jika ada)" />
+    <button type="submit">Upload</button>
+  </form>
+  <div id="status"></div>
+<script>
+document.getElementById('frm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = document.getElementById('file').files[0];
+  if (!f) { alert('Pilih file zip'); return; }
+  const fd = new FormData();
+  fd.append('file', f, f.name);
+  const apiKey = document.getElementById('apikey').value;
+  try {
+    const res = await fetch('/upload', {
+      method: 'POST',
+      headers: apiKey ? { 'x-api-key': apiKey } : {},
+      body: fd
+    });
+    const j = await res.json();
+    if (!res.ok) alert('Gagal: ' + (j.detail || JSON.stringify(j)));
+    else alert('Sukses. Ditambahkan: ' + j.inserted_rows + ' fitur.');
+  } catch (err) {
+    alert('Error: ' + err);
+  }
+});
+</script>
+</body>
+</html>
